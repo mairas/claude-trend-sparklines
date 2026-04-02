@@ -1,269 +1,445 @@
-use crate::history;
+use image::{ImageEncoder, Rgba, RgbaImage};
 
-/// ANSI color codes
-const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
-const DARK_GRAY: &str = "\x1b[90m";
-const RESET: &str = "\x1b[0m";
-
-/// Block elements indexed 0-8: space, then ▁▂▃▄▅▆▇█
-const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-/// Classification of a sparkline slot.
-#[derive(Debug, PartialEq)]
-enum SlotKind {
-    Completed,
-    Current,
-    Future,
+/// A single history data point with its window identity.
+#[derive(Debug, Clone)]
+pub struct HistoryPoint {
+    pub ts: u64,
+    pub pct: f64,
+    pub resets_at: u64,
 }
 
-/// Render a sparkline string for a usage window.
-///
-/// - `remaining_min`: minutes until the window resets
-/// - `window_min`: total window duration in minutes (300 or 10080)
-/// - `total_slots`: number of graph characters (8 or 7)
-/// - `history_entries`: sorted (timestamp, cumulative_usage_pct) pairs, after reset detection
-/// - `current_pct`: live usage percentage from stdin
-/// - `now`: current unix timestamp
-pub fn render(
-    remaining_min: f64,
-    window_min: f64,
-    total_slots: usize,
-    history_entries: &[(u64, f64)],
-    current_pct: f64,
-    now: u64,
-) -> String {
-    let elapsed_min = (window_min - remaining_min).max(0.0);
-    let window_start = now as f64 - elapsed_min * 60.0;
-    let window_secs = window_min * 60.0;
+/// Parameters controlling the bitmap render.
+#[derive(Debug, Clone)]
+pub struct RenderParams {
+    pub width_px: u32,
+    pub height_px: u32,
+    pub window_duration_secs: u64,
+    pub now: u64,
+    pub current_pct: f64,
+    pub current_resets_at: u64,
+    pub grid_interval_secs: u64,
+}
 
-    // Determine which slot "now" falls into (0-indexed)
-    let current_slot_idx = ((elapsed_min * total_slots as f64) / window_min)
-        .floor()
-        .min(total_slots as f64 - 1.0)
-        .max(0.0) as usize;
+const COLOR_GREEN: Rgba<u8> = Rgba([0, 200, 0, 180]);
+const COLOR_RED: Rgba<u8> = Rgba([230, 0, 0, 180]);
+const COLOR_GRAY_FILL: Rgba<u8> = Rgba([128, 128, 128, 100]);
+const COLOR_PACE_LINE: Rgba<u8> = Rgba([200, 200, 200, 160]);
+const COLOR_GRIDLINE: Rgba<u8> = Rgba([80, 80, 80, 60]);
+const COLOR_RESET_MARKER: Rgba<u8> = Rgba([220, 200, 0, 200]);
+const COLOR_TRANSPARENT: Rgba<u8> = Rgba([0, 0, 0, 0]);
 
-    let mut out = String::new();
+/// Map a percentage (0-100) to a y pixel coordinate.
+/// 0% is at the bottom (y = height-1), 100% is at the top (y = 0).
+fn pct_to_y(pct: f64, height: u32) -> f64 {
+    (height - 1) as f64 - (pct / 100.0 * (height - 1) as f64)
+}
 
-    for i in 0..total_slots {
-        let slot_end_time = window_start + (i + 1) as f64 / total_slots as f64 * window_secs;
-        let pace = (i + 1) as f64 / total_slots as f64 * 100.0;
+/// Interpolate usage percentage at a given timestamp from sorted history entries.
+/// Returns None if the timestamp is before the first entry.
+fn interpolate_usage(entries: &[HistoryPoint], ts: f64) -> Option<f64> {
+    if entries.is_empty() {
+        return None;
+    }
+    if ts < entries[0].ts as f64 {
+        return None;
+    }
+    if ts >= entries[entries.len() - 1].ts as f64 {
+        return Some(entries[entries.len() - 1].pct);
+    }
 
-        let kind = if i < current_slot_idx {
-            SlotKind::Completed
-        } else if i == current_slot_idx {
-            SlotKind::Current
+    // Find the two surrounding entries
+    for i in 0..entries.len() - 1 {
+        let a = &entries[i];
+        let b = &entries[i + 1];
+        if ts >= a.ts as f64 && ts <= b.ts as f64 {
+            let span = (b.ts as f64 - a.ts as f64).max(1.0);
+            let frac = (ts - a.ts as f64) / span;
+            return Some(a.pct + (b.pct - a.pct) * frac);
+        }
+    }
+
+    Some(entries[entries.len() - 1].pct)
+}
+
+/// Find the window segment (by resets_at) that applies at a given timestamp.
+/// Returns (segment_start_ts, segment_resets_at) or None.
+fn find_segment(entries: &[HistoryPoint], ts: f64, params: &RenderParams) -> (f64, u64) {
+    // Walk entries to find the segment active at this timestamp.
+    // A segment is defined by a contiguous run of entries with the same resets_at.
+    // The segment that applies at `ts` is the last segment whose first entry is <= ts.
+    if entries.is_empty() {
+        let window_start = params.now as f64 - params.window_duration_secs as f64;
+        return (window_start, params.current_resets_at);
+    }
+
+    let mut seg_start = entries[0].ts as f64;
+    let mut seg_resets_at = entries[0].resets_at;
+
+    for i in 1..entries.len() {
+        if entries[i].resets_at != entries[i - 1].resets_at {
+            // New segment starts
+            if entries[i].ts as f64 > ts {
+                // This new segment starts after our timestamp, so previous segment applies
+                return (seg_start, seg_resets_at);
+            }
+            seg_start = entries[i].ts as f64;
+            seg_resets_at = entries[i].resets_at;
+        }
+    }
+
+    (seg_start, seg_resets_at)
+}
+
+/// Calculate the pace percentage at a given timestamp within a segment.
+/// Pace is linear 0% at segment start to 100% at resets_at.
+fn pace_at(ts: f64, segment_start: f64, resets_at: u64) -> f64 {
+    let duration = (resets_at as f64 - segment_start).max(1.0);
+    let elapsed = (ts - segment_start).max(0.0);
+    (elapsed / duration * 100.0).clamp(0.0, 100.0)
+}
+
+/// Find timestamps where resets_at changes between adjacent entries.
+fn find_reset_boundaries(entries: &[HistoryPoint]) -> Vec<f64> {
+    let mut boundaries = Vec::new();
+    for i in 1..entries.len() {
+        if entries[i].resets_at != entries[i - 1].resets_at {
+            // Place marker at the midpoint between the two entries
+            boundaries.push((entries[i - 1].ts as f64 + entries[i].ts as f64) / 2.0);
+        }
+    }
+    boundaries
+}
+
+/// Render a sparkline as an RGBA bitmap image.
+pub fn render_bitmap(entries: &[HistoryPoint], params: &RenderParams) -> RgbaImage {
+    let w = params.width_px;
+    let h = params.height_px;
+    let mut img = RgbaImage::from_pixel(w, h, COLOR_TRANSPARENT);
+
+    let window_start = params.now as f64 - params.window_duration_secs as f64;
+    let window_span = params.window_duration_secs as f64;
+
+    let reset_boundaries = find_reset_boundaries(entries);
+
+    for x in 0..w {
+        let ts = window_start + (x as f64 / (w - 1).max(1) as f64) * window_span;
+
+        // Determine segment for pace calculation
+        let (seg_start, seg_resets_at) = find_segment(entries, ts, params);
+        let pace = pace_at(ts, seg_start, seg_resets_at);
+        let pace_y = pct_to_y(pace, h);
+
+        // Interpolate usage at this column
+        let usage = interpolate_usage(entries, ts);
+
+        // Check if this column is a reset boundary
+        let is_reset = reset_boundaries.iter().any(|&bt| {
+            let bx = ((bt - window_start) / window_span * (w - 1) as f64).round() as i64;
+            (bx - x as i64).abs() <= 0
+        });
+
+        // Check if this column is a grid line
+        let is_gridline = if params.grid_interval_secs > 0 {
+            let aligned = (ts / params.grid_interval_secs as f64).floor()
+                * params.grid_interval_secs as f64;
+            let grid_x = ((aligned - window_start) / window_span * (w - 1) as f64).round() as i64;
+            grid_x == x as i64
         } else {
-            SlotKind::Future
+            false
         };
 
-        match kind {
-            SlotKind::Completed => {
-                match history::interpolate_at(history_entries, slot_end_time as u64) {
-                    Some(val) => {
-                        let color = if val <= pace { GREEN } else { RED };
-                        let block = value_to_block(val, total_slots);
-                        out.push_str(&format!("{color}{block}{RESET}"));
+        match usage {
+            Some(usage_pct) => {
+                let usage_y = pct_to_y(usage_pct, h);
+                let fill_top_y = usage_y.min(pace_y);
+
+                // Fill from bottom up to max(usage, pace)
+                for y in 0..h {
+                    let yf = y as f64;
+
+                    if is_reset {
+                        // Reset marker: full-height yellow line
+                        img.put_pixel(x, y, COLOR_RESET_MARKER);
+                    } else if yf >= fill_top_y {
+                        // Below the higher of usage/pace — fill area
+                        if yf >= usage_y && usage_pct <= pace {
+                            // Usage region, under pace
+                            img.put_pixel(x, y, COLOR_GREEN);
+                        } else if yf >= usage_y && usage_pct > pace {
+                            // Usage region, over pace — the part up to pace is green,
+                            // the part above pace is red
+                            if yf <= pace_y {
+                                // Above pace line (y is smaller = higher) — red zone
+                                img.put_pixel(x, y, COLOR_RED);
+                            } else {
+                                // Below pace line — green zone
+                                img.put_pixel(x, y, COLOR_GREEN);
+                            }
+                        } else if yf >= pace_y && yf > usage_y {
+                            // Between usage top and pace line (pace is below usage visually)
+                            // This is the gray fill below pace when pace < usage
+                            img.put_pixel(x, y, COLOR_GRAY_FILL);
+                        }
+
+                        // Pace line overlay (thin, 1px)
+                        if (yf - pace_y).abs() < 1.0 {
+                            img.put_pixel(x, y, COLOR_PACE_LINE);
+                        }
                     }
-                    None => {
-                        // No data for this slot — render as gray pace reference
-                        let block = value_to_block(pace, total_slots);
-                        out.push_str(&format!("{DARK_GRAY}{block}{RESET}"));
+
+                    // Gridline (faint, through entire height where there's fill)
+                    if is_gridline && yf >= fill_top_y && !is_reset {
+                        img.put_pixel(x, y, COLOR_GRIDLINE);
                     }
                 }
             }
-            SlotKind::Current => {
-                let val = current_pct;
-                let color = if val <= pace { GREEN } else { RED };
-                let block = value_to_block(val, total_slots);
-                out.push_str(&format!("{color}{block}{RESET}"));
-            }
-            SlotKind::Future => {
-                let block = value_to_block(pace, total_slots);
-                out.push_str(&format!("{DARK_GRAY}{block}{RESET}"));
+            None => {
+                // No data (before first entry or future): gray fill below pace
+                for y in 0..h {
+                    let yf = y as f64;
+
+                    if is_reset {
+                        img.put_pixel(x, y, COLOR_RESET_MARKER);
+                    } else if yf >= pace_y {
+                        img.put_pixel(x, y, COLOR_GRAY_FILL);
+                        if (yf - pace_y).abs() < 1.0 {
+                            img.put_pixel(x, y, COLOR_PACE_LINE);
+                        }
+                    }
+
+                    if is_gridline && yf >= pace_y && !is_reset {
+                        img.put_pixel(x, y, COLOR_GRIDLINE);
+                    }
+                }
             }
         }
     }
 
-    out
+    img
 }
 
-/// Map a percentage (0-100) to a block character.
-/// Uses total_slots as the scale (so 100% maps to the highest block).
-/// Minimum level for any positive value is 1 (▁).
-fn value_to_block(pct: f64, total_slots: usize) -> char {
-    let level = (pct * total_slots as f64 / 100.0)
-        .round()
-        .min(total_slots as f64)
-        .max(0.0) as usize;
-    // Ensure minimum ▁ for any non-zero value
-    let level = if pct > 0.0 && level < 1 { 1 } else { level };
-    // Clamp to available block chars
-    let level = level.min(BLOCKS.len() - 1);
-    BLOCKS[level]
+/// Encode an RgbaImage as PNG bytes in memory.
+pub fn encode_png(img: &RgbaImage) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+    encoder
+        .write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8)
+        .expect("PNG encoding failed");
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn strip_ansi(s: &str) -> String {
-        let mut out = String::new();
-        let mut in_escape = false;
-        for c in s.chars() {
-            if c == '\x1b' {
-                in_escape = true;
-            } else if in_escape {
-                if c == 'm' {
-                    in_escape = false;
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn mostly_future_at_start() {
-        // Window just started, no elapsed time
-        let result = render(300.0, 300.0, 8, &[], 0.0, 1000);
-        let plain = strip_ansi(&result);
-        assert_eq!(plain.chars().count(), 8);
-        // Slot 0 is current (green, 0% usage ≤ 12.5% pace), slots 1-7 are future (dark gray)
-        assert!(result.contains(DARK_GRAY));
-        assert!(result.contains(GREEN));
-    }
-
-    #[test]
-    fn current_slot_shows_live_data() {
-        // 37.5 min into 5h window = slot 0 is current
-        let now = 1000 + 37 * 60; // ~37 min elapsed
-        let result = render(263.0, 300.0, 8, &[], 5.0, now as u64);
-        let plain = strip_ansi(&result);
-        // First char should be ▁ (current slot with 5%), rest future
-        assert_eq!(plain.chars().next().unwrap(), '▁');
-    }
-
-    #[test]
-    fn completed_slot_uses_interpolation() {
-        // 80 min into 5h window: slots 0,1 completed, slot 2 current
-        let now: u64 = 10000;
-        let window_start = now - 80 * 60;
-
-        // History: steady ramp
-        let entries: Vec<(u64, f64)> = vec![
-            (window_start, 0.0),
-            (window_start + 20 * 60, 8.0),  // 20 min in
-            (window_start + 40 * 60, 16.0), // 40 min in (past slot 0 boundary at 37.5)
-            (window_start + 60 * 60, 24.0), // 60 min in
-            (window_start + 75 * 60, 30.0), // 75 min in (past slot 1 boundary at 75)
-        ];
-
-        let result = render(220.0, 300.0, 8, &entries, 32.0, now);
-        let plain = strip_ansi(&result);
-        assert_eq!(plain.chars().count(), 8);
-
-        // Slot 0 boundary at 37.5 min: interpolated between (20min,8%) and (40min,16%)
-        // = 8 + (16-8) * (17.5/20) = 8 + 7 = 15%
-        // Pace at slot 0 = 12.5%. 15% > 12.5% → should be RED
-        assert!(result.starts_with(RED));
-    }
-
-    #[test]
-    fn under_pace_is_green() {
-        let now: u64 = 10000;
-        let window_start = now - 80 * 60;
-
-        // Low usage: well under pace
-        let entries: Vec<(u64, f64)> = vec![
-            (window_start, 0.0),
-            (window_start + 40 * 60, 5.0),
-            (window_start + 75 * 60, 10.0),
-        ];
-
-        let result = render(220.0, 300.0, 8, &entries, 12.0, now);
-        // Slot 0 boundary: interpolated ~5% at 37.5 min, pace 12.5% → green
-        assert!(result.starts_with(GREEN));
-    }
-
-    #[test]
-    fn future_slots_show_pace_reference() {
-        // 37 min in, slot 0 is current, slots 1-7 are future
-        let now: u64 = 10000;
-        let result = render(263.0, 300.0, 8, &[], 5.0, now);
-        let plain = strip_ansi(&result);
-        let chars: Vec<char> = plain.chars().collect();
-        // Future slots should show increasing pace blocks
-        // Slot 1: pace 25% → block ~2, slot 2: pace 37.5% → block ~3, etc.
-        // Just verify they're non-empty and increasing
-        assert!(chars.len() == 8);
-        for i in 2..8 {
-            assert!(chars[i] >= chars[i - 1], "future blocks should be non-decreasing");
+    fn make_params(width: u32, height: u32) -> RenderParams {
+        RenderParams {
+            width_px: width,
+            height_px: height,
+            window_duration_secs: 5 * 3600, // 5 hours
+            now: 100_000,
+            current_pct: 50.0,
+            current_resets_at: 100_000 + 2 * 3600, // resets 2h from now
+            grid_interval_secs: 3600,
         }
     }
 
     #[test]
-    fn seven_day_window() {
-        let now: u64 = 100000;
-        let result = render(10080.0, 10080.0, 7, &[], 0.0, now);
-        let plain = strip_ansi(&result);
-        assert_eq!(plain.chars().count(), 7);
+    fn generates_image_with_correct_dimensions() {
+        let params = make_params(200, 40);
+        let img = render_bitmap(&[], &params);
+        assert_eq!(img.width(), 200);
+        assert_eq!(img.height(), 40);
     }
 
     #[test]
-    fn block_mapping() {
-        assert_eq!(value_to_block(0.0, 8), ' ');
-        assert_eq!(value_to_block(1.0, 8), '▁'); // minimum for positive
-        assert_eq!(value_to_block(100.0, 8), '█');
-        assert_eq!(value_to_block(50.0, 8), '▄');
-    }
-
-    #[test]
-    fn no_snapping_on_slot_transition() {
-        // Simulate the bug scenario: usage over pace, transitioning from slot 1 to slot 2
-        let now: u64 = 10000;
-        let elapsed_min = 80.0;
-        let window_start = now - (elapsed_min as u64) * 60;
-
-        // Usage ramp that's above pace at slot 0 boundary
-        let entries: Vec<(u64, f64)> = vec![
-            (window_start, 0.0),
-            (window_start + 10 * 60, 5.0),
-            (window_start + 20 * 60, 12.0),
-            (window_start + 35 * 60, 18.0), // near slot 0 end
-            (window_start + 50 * 60, 22.0),
-            (window_start + 70 * 60, 28.0), // near slot 1 end
-        ];
-
-        // Render at 80 min (slot 2 is current)
-        let r1 = render(220.0, 300.0, 8, &entries, 32.0, now);
-
-        // Render 20 min later at 100 min (slot 2 is still current, approaching slot 3)
-        let now2 = now + 20 * 60;
-        let entries2: Vec<(u64, f64)> = {
-            let mut e = entries.clone();
-            e.push((now2 - 10 * 60, 36.0));
-            e
-        };
-        let r2 = render(200.0, 300.0, 8, &entries2, 40.0, now2);
-
-        // Slot 0 color should be the same in both renders
-        // (the completed slot shouldn't change color as time passes)
-        let slot0_color_r1 = if r1.starts_with(RED) { "red" } else { "green" };
-        let slot0_color_r2 = if r2.starts_with(RED) { "red" } else { "green" };
-        assert_eq!(
-            slot0_color_r1, slot0_color_r2,
-            "completed slot 0 color must not change between renders"
+    fn empty_history_renders_pace_only() {
+        let params = make_params(100, 30);
+        let img = render_bitmap(&[], &params);
+        // With no history, the pace line and gray fill should produce
+        // some non-transparent pixels.
+        let non_transparent = img.pixels().filter(|p| p.0[3] > 0).count();
+        assert!(
+            non_transparent > 0,
+            "empty history should still render pace line and gray fill"
         );
     }
 
     #[test]
-    fn end_of_window() {
-        // Very end of window: all slots completed or current
-        let now: u64 = 10000;
-        let result = render(1.0, 300.0, 8, &[], 95.0, now);
-        let plain = strip_ansi(&result);
-        assert_eq!(plain.chars().count(), 8);
+    fn usage_below_pace_is_green() {
+        let now = 100_000u64;
+        let window_dur = 5 * 3600u64;
+        let resets_at = now + 2 * 3600;
+
+        // Usage slowly ramping — well below linear pace
+        let entries: Vec<HistoryPoint> = vec![
+            HistoryPoint { ts: now - window_dur, pct: 0.0, resets_at },
+            HistoryPoint { ts: now - window_dur / 2, pct: 10.0, resets_at },
+            HistoryPoint { ts: now, pct: 20.0, resets_at },
+        ];
+
+        let params = RenderParams {
+            width_px: 100,
+            height_px: 30,
+            window_duration_secs: window_dur,
+            now,
+            current_pct: 20.0,
+            current_resets_at: resets_at,
+            grid_interval_secs: 3600,
+        };
+
+        let img = render_bitmap(&entries, &params);
+
+        // Count green-dominant pixels (G channel highest, alpha > 0)
+        let green_pixels = img
+            .pixels()
+            .filter(|p| p.0[3] > 0 && p.0[1] > p.0[0] && p.0[1] > p.0[2])
+            .count();
+        assert!(
+            green_pixels > 50,
+            "usage below pace should produce green-filled area, got {green_pixels}"
+        );
+    }
+
+    #[test]
+    fn usage_above_pace_is_red() {
+        let now = 100_000u64;
+        let window_dur = 5 * 3600u64;
+        let resets_at = now + 1 * 3600; // only 1h left — tight window
+
+        // Usage ramping fast — above linear pace
+        let entries: Vec<HistoryPoint> = vec![
+            HistoryPoint { ts: now - window_dur, pct: 0.0, resets_at },
+            HistoryPoint { ts: now - window_dur / 2, pct: 70.0, resets_at },
+            HistoryPoint { ts: now, pct: 95.0, resets_at },
+        ];
+
+        let params = RenderParams {
+            width_px: 100,
+            height_px: 30,
+            window_duration_secs: window_dur,
+            now,
+            current_pct: 95.0,
+            current_resets_at: resets_at,
+            grid_interval_secs: 3600,
+        };
+
+        let img = render_bitmap(&entries, &params);
+
+        let red_pixels = img
+            .pixels()
+            .filter(|p| p.0[3] > 0 && p.0[0] > p.0[1] && p.0[0] > p.0[2])
+            .count();
+        assert!(
+            red_pixels > 20,
+            "usage above pace should produce red-filled area, got {red_pixels}"
+        );
+    }
+
+    #[test]
+    fn reset_marker_creates_visible_line() {
+        let now = 100_000u64;
+        let window_dur = 5 * 3600u64;
+        let reset1 = now - 1000; // first window resets near now
+        let reset2 = now + 2 * 3600; // second window
+
+        let entries: Vec<HistoryPoint> = vec![
+            HistoryPoint { ts: now - window_dur, pct: 0.0, resets_at: reset1 },
+            HistoryPoint { ts: now - window_dur / 2, pct: 50.0, resets_at: reset1 },
+            // Window boundary — resets_at changes
+            HistoryPoint { ts: now - window_dur / 2 + 1, pct: 0.0, resets_at: reset2 },
+            HistoryPoint { ts: now, pct: 30.0, resets_at: reset2 },
+        ];
+
+        let params = RenderParams {
+            width_px: 200,
+            height_px: 40,
+            window_duration_secs: window_dur,
+            now,
+            current_pct: 30.0,
+            current_resets_at: reset2,
+            grid_interval_secs: 3600,
+        };
+
+        let img = render_bitmap(&entries, &params);
+
+        // Yellow pixels: R and G channels high, B channel low
+        let yellow_pixels = img
+            .pixels()
+            .filter(|p| p.0[3] > 0 && p.0[0] > 150 && p.0[1] > 150 && p.0[2] < 100)
+            .count();
+        assert!(
+            yellow_pixels > 5,
+            "reset boundary should produce yellow marker pixels, got {yellow_pixels}"
+        );
+    }
+
+    #[test]
+    fn transparent_background() {
+        let now = 100_000u64;
+        let window_dur = 5 * 3600u64;
+        let resets_at = now + 2 * 3600;
+
+        let entries: Vec<HistoryPoint> = vec![
+            HistoryPoint { ts: now - window_dur, pct: 0.0, resets_at },
+            HistoryPoint { ts: now, pct: 30.0, resets_at },
+        ];
+
+        let params = RenderParams {
+            width_px: 100,
+            height_px: 30,
+            window_duration_secs: window_dur,
+            now,
+            current_pct: 30.0,
+            current_resets_at: resets_at,
+            grid_interval_secs: 3600,
+        };
+
+        let img = render_bitmap(&entries, &params);
+
+        // Top row should be mostly transparent (usage is 30%, pace line
+        // at most ~100% at far right, so top-left corner should be clear)
+        let top_left = img.get_pixel(0, 0);
+        assert_eq!(
+            top_left.0[3], 0,
+            "background pixels above curve should be fully transparent"
+        );
+    }
+
+    #[test]
+    fn save_test_render() {
+        let now = 100_000u64;
+        let window_dur = 5 * 3600u64;
+        let reset1 = now - 2 * 3600 + 500;
+        let reset2 = now + 2 * 3600;
+
+        let entries: Vec<HistoryPoint> = vec![
+            HistoryPoint { ts: now - window_dur, pct: 0.0, resets_at: reset1 },
+            HistoryPoint { ts: now - 4 * 3600, pct: 15.0, resets_at: reset1 },
+            HistoryPoint { ts: now - 3 * 3600, pct: 35.0, resets_at: reset1 },
+            HistoryPoint { ts: now - 2 * 3600, pct: 60.0, resets_at: reset1 },
+            // Reset boundary
+            HistoryPoint { ts: now - 2 * 3600 + 1, pct: 0.0, resets_at: reset2 },
+            HistoryPoint { ts: now - 1 * 3600, pct: 25.0, resets_at: reset2 },
+            HistoryPoint { ts: now, pct: 45.0, resets_at: reset2 },
+        ];
+
+        let params = RenderParams {
+            width_px: 300,
+            height_px: 60,
+            window_duration_secs: window_dur,
+            now,
+            current_pct: 45.0,
+            current_resets_at: reset2,
+            grid_interval_secs: 3600,
+        };
+
+        let img = render_bitmap(&entries, &params);
+        let png_bytes = encode_png(&img);
+
+        std::fs::write("/tmp/sparkline-test.png", &png_bytes).expect("failed to write test PNG");
+
+        // This test always passes — it's for visual inspection
+        assert!(!png_bytes.is_empty(), "PNG output should not be empty");
     }
 }

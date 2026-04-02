@@ -15,6 +15,11 @@ fn main() {
         .unwrap_or_default()
         .as_secs();
 
+    // ── Graphics protocol detection ──
+    let protocol = terminal::detect_protocol();
+    let cell_size = terminal::query_cell_size();
+    let graph_cols: u32 = 12;
+
     // ── Effort level from settings.json ──
     let effort_icon = read_effort_icon();
 
@@ -69,11 +74,14 @@ fn main() {
 
     let window_5h = rl
         .and_then(|r| r.five_hour.as_ref())
-        .and_then(|w| render_window(w, "5h", 300.0, 8, now));
+        .and_then(|w| render_window(w, "5h", 300.0, now, protocol, cell_size, graph_cols));
+
+    // Re-query cell_size since it was moved
+    let cell_size = terminal::query_cell_size();
 
     let window_7d = rl
         .and_then(|r| r.seven_day.as_ref())
-        .and_then(|w| render_window(w, "7d", 10080.0, 7, now));
+        .and_then(|w| render_window(w, "7d", 10080.0, now, protocol, cell_size, graph_cols));
 
     let mut right2 = String::new();
     if let Some(w5) = window_5h {
@@ -186,8 +194,10 @@ fn render_window(
     window: &input::WindowLimit,
     label: &str,
     window_min: f64,
-    slots: usize,
     now: u64,
+    protocol: terminal::GraphicsProtocol,
+    cell_size: terminal::CellSize,
+    graph_cols: u32,
 ) -> Option<String> {
     let used_pct = window.used_percentage?;
     let resets_at = window.resets_at?;
@@ -199,22 +209,55 @@ fn render_window(
     };
     let remaining_min = remaining_secs as f64 / 60.0;
 
-    // Load history for sparkline
-    let hist = history::read();
-    let elapsed_min = (window_min - remaining_min).max(0.0);
-    let window_start = now - (elapsed_min * 60.0) as u64;
-
-    let field = match label {
-        "5h" => history::WindowField::FiveHour,
-        _ => history::WindowField::SevenDay,
-    };
-    let entries = history::window_entries(&hist, window_start, field, resets_at);
-
-    let sl = sparkline::render(remaining_min, window_min, slots, &entries, used_pct, now);
-
     let pct_str = format::color_pct(used_pct);
     let delta = format::pace_delta(used_pct, remaining_min, window_min);
     let cd = format::countdown(remaining_min);
 
-    Some(format!("{label} {sl} {pct_str}{delta} {cd}"))
+    if protocol != terminal::GraphicsProtocol::None {
+        let window_secs = (window_min * 60.0) as u64;
+        let view_start = now.saturating_sub(window_secs);
+        let view_end = now;
+
+        let field = match label {
+            "5h" => history::WindowField::FiveHour,
+            _ => history::WindowField::SevenDay,
+        };
+
+        let hist = history::read();
+        let points = history::history_points(&hist, view_start, view_end, field);
+
+        let grid_interval_secs: u64 = match label {
+            "5h" => 3600,
+            _ => 86400,
+        };
+
+        let params = sparkline::RenderParams {
+            width_px: graph_cols * cell_size.width,
+            height_px: cell_size.height,
+            window_duration_secs: window_secs,
+            now,
+            current_pct: used_pct,
+            current_resets_at: resets_at,
+            grid_interval_secs,
+        };
+
+        let img = sparkline::render_bitmap(&points, &params);
+        let png_data = sparkline::encode_png(&img);
+
+        match protocol {
+            terminal::GraphicsProtocol::Kitty => {
+                terminal::emit_kitty_inline(&png_data, graph_cols);
+            }
+            terminal::GraphicsProtocol::Sixel => {
+                terminal::emit_sixel_inline(&img);
+            }
+            terminal::GraphicsProtocol::None => unreachable!(),
+        }
+
+        // Padding spaces to account for the image's visual width
+        let padding = " ".repeat(graph_cols as usize);
+        Some(format!("{label} {padding}{pct_str}{delta} {cd}"))
+    } else {
+        Some(format!("{label} {pct_str}{delta} {cd}"))
+    }
 }

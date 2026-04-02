@@ -1,3 +1,4 @@
+use crate::sparkline::HistoryPoint;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -185,6 +186,34 @@ impl WindowField {
             WindowField::SevenDay => entry.seven_day_resets_at(),
         }
     }
+}
+
+/// Extract HistoryPoint data from raw entries for a given window field and time range.
+/// Skips entries with missing usage percentage or resets_at.
+pub fn history_points(
+    entries: &[Entry],
+    view_start: u64,
+    view_end: u64,
+    field: WindowField,
+) -> Vec<HistoryPoint> {
+    let mut result = Vec::new();
+    for entry in entries {
+        if entry.ts < view_start || entry.ts > view_end {
+            continue;
+        }
+        let Some(pct) = field.get(entry) else {
+            continue;
+        };
+        let Some(resets_at) = field.resets_at(entry) else {
+            continue;
+        };
+        result.push(HistoryPoint {
+            ts: entry.ts,
+            pct,
+            resets_at,
+        });
+    }
+    result
 }
 
 /// Interpolate a value at a specific timestamp from sorted (ts, value) pairs.
