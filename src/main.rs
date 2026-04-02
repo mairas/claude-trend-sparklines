@@ -76,9 +76,6 @@ fn main() {
         .and_then(|r| r.five_hour.as_ref())
         .and_then(|w| render_window(w, "5h", 300.0, now, protocol, cell_size, graph_cols));
 
-    // Re-query cell_size since it was moved
-    let cell_size = terminal::query_cell_size();
-
     let window_7d = rl
         .and_then(|r| r.seven_day.as_ref())
         .and_then(|w| render_window(w, "7d", 10080.0, now, protocol, cell_size, graph_cols));
@@ -244,19 +241,17 @@ fn render_window(
         let img = sparkline::render_bitmap(&points, &params);
         let png_data = sparkline::encode_png(&img);
 
-        match protocol {
+        let img_seq = match protocol {
             terminal::GraphicsProtocol::Kitty => {
-                terminal::emit_kitty_inline(&png_data, graph_cols);
+                terminal::kitty_inline(&png_data, graph_cols)
             }
             terminal::GraphicsProtocol::Sixel => {
-                terminal::emit_sixel_inline(&img);
+                terminal::sixel_inline(&img)
             }
             terminal::GraphicsProtocol::None => unreachable!(),
-        }
+        };
 
-        // Padding spaces to account for the image's visual width
-        let padding = " ".repeat(graph_cols as usize);
-        Some(format!("{label} {padding}{pct_str}{delta} {cd}"))
+        Some(format!("{label} {img_seq}{pct_str}{delta} {cd}"))
     } else {
         Some(format!("{label} {pct_str}{delta} {cd}"))
     }

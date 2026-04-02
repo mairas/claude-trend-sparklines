@@ -1,8 +1,8 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use image::RgbaImage;
-use std::io::{self, Write};
-use viuer::KittySupport;
+use std::env;
+use std::fmt::Write;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GraphicsProtocol {
@@ -11,16 +11,31 @@ pub enum GraphicsProtocol {
     None,
 }
 
+/// Detect graphics protocol from environment variables.
+/// No terminal probing — avoids stdout contamination.
 pub fn detect_protocol() -> GraphicsProtocol {
-    if viuer::get_kitty_support() != KittySupport::None {
+    let term = env::var("TERM").unwrap_or_default().to_lowercase();
+    let term_program = env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
+
+    // Kitty protocol: Ghostty, Kitty, WezTerm, VS Code terminal
+    if term.contains("ghostty")
+        || term.contains("xterm-kitty")
+        || term_program.contains("ghostty")
+        || term_program.contains("kitty")
+        || term_program.contains("wezterm")
+    {
         return GraphicsProtocol::Kitty;
     }
-    if viuer::is_sixel_supported() {
+
+    // Sixel: iTerm2, foot, others
+    if term_program.contains("iterm") || term.contains("foot") {
         return GraphicsProtocol::Sixel;
     }
+
     GraphicsProtocol::None
 }
 
+#[derive(Clone, Copy)]
 pub struct CellSize {
     pub width: u32,
     pub height: u32,
@@ -39,9 +54,9 @@ pub fn query_cell_size() -> CellSize {
     CellSize::default()
 }
 
-/// Emit a PNG image inline using the Kitty graphics protocol.
-/// Chunks base64 data at 4096 bytes.
-pub fn emit_kitty_inline(png_data: &[u8], cols: u32) {
+/// Encode a PNG image as a Kitty graphics protocol escape sequence string.
+/// The image occupies `cols` terminal columns.
+pub fn kitty_inline(png_data: &[u8], cols: u32) -> String {
     let encoded = BASE64.encode(png_data);
     let chunk_size = 4096;
     let chunks: Vec<&str> = encoded
@@ -50,17 +65,16 @@ pub fn emit_kitty_inline(png_data: &[u8], cols: u32) {
         .map(|c| std::str::from_utf8(c).unwrap())
         .collect();
 
-    let mut stdout = io::stdout().lock();
+    let mut out = String::new();
     for (i, chunk) in chunks.iter().enumerate() {
         let more = if i + 1 < chunks.len() { 1 } else { 0 };
         if i == 0 {
-            write!(stdout, "\x1b_Gf=100,a=T,c={cols},m={more};{chunk}\x1b\\")
-                .ok();
+            write!(out, "\x1b_Gf=100,a=T,c={cols},m={more};{chunk}\x1b\\").ok();
         } else {
-            write!(stdout, "\x1b_Gm={more};{chunk}\x1b\\").ok();
+            write!(out, "\x1b_Gm={more};{chunk}\x1b\\").ok();
         }
     }
-    stdout.flush().ok();
+    out
 }
 
 /// Simple nearest-color palette for sixel output.
@@ -99,53 +113,44 @@ impl SixelPalette {
     }
 }
 
-/// Emit an RGBA image inline using the Sixel graphics protocol.
-pub fn emit_sixel_inline(img: &RgbaImage) {
+/// Encode an RGBA image as a Sixel escape sequence string.
+pub fn sixel_inline(img: &RgbaImage) -> String {
     let palette = SixelPalette::new();
     let (w, h) = img.dimensions();
-    let mut stdout = io::stdout().lock();
+    let mut out = String::new();
 
-    // Start sixel stream
-    write!(stdout, "\x1bPq").ok();
+    write!(out, "\x1bPq").ok();
 
-    // Register palette colors
     for (i, (r, g, b)) in palette.colors.iter().enumerate() {
         let rp = SixelPalette::to_percent(*r);
         let gp = SixelPalette::to_percent(*g);
         let bp = SixelPalette::to_percent(*b);
-        write!(stdout, "#{i};2;{rp};{gp};{bp}").ok();
+        write!(out, "#{i};2;{rp};{gp};{bp}").ok();
     }
 
-    // Encode bands of 6 rows
     let num_bands = (h + 5) / 6;
     for band in 0..num_bands {
         let y_start = band * 6;
 
         for color_idx in 0..palette.colors.len() {
-            // Check if this color appears in this band at all
             let mut has_color = false;
-            for x in 0..w {
+            'outer: for x in 0..w {
                 for dy in 0..6 {
                     let y = y_start + dy;
                     if y < h {
                         let px = img.get_pixel(x, y);
-                        if px[3] > 127 {
-                            if palette.nearest(px[0], px[1], px[2]) == color_idx {
-                                has_color = true;
-                                break;
-                            }
+                        if px[3] > 127 && palette.nearest(px[0], px[1], px[2]) == color_idx {
+                            has_color = true;
+                            break 'outer;
                         }
                     }
-                }
-                if has_color {
-                    break;
                 }
             }
             if !has_color {
                 continue;
             }
 
-            write!(stdout, "#{color_idx}").ok();
+            write!(out, "#{color_idx}").ok();
 
             for x in 0..w {
                 let mut sixel_bits: u8 = 0;
@@ -160,21 +165,17 @@ pub fn emit_sixel_inline(img: &RgbaImage) {
                         }
                     }
                 }
-                // Sixel character = bits + 63
-                write!(stdout, "{}", (sixel_bits + 63) as char).ok();
+                write!(out, "{}", (sixel_bits + 63) as char).ok();
             }
 
-            // '$' = carriage return within band (stay on same band for next color)
-            write!(stdout, "$").ok();
+            write!(out, "$").ok();
         }
 
-        // '-' = newline (advance to next band)
         if band + 1 < num_bands {
-            write!(stdout, "-").ok();
+            write!(out, "-").ok();
         }
     }
 
-    // End sixel stream
-    write!(stdout, "\x1b\\").ok();
-    stdout.flush().ok();
+    write!(out, "\x1b\\").ok();
+    out
 }
