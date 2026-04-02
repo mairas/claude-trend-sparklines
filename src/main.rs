@@ -3,6 +3,7 @@ mod git;
 mod history;
 mod input;
 mod sparkline;
+mod terminal;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
