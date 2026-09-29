@@ -13,6 +13,18 @@ fn state_path() -> PathBuf {
         .join("claude-trend-sparklines-state.json")
 }
 
+/// The resolved account `rate_limits`, for hooks. `None` if nothing has been recorded.
+/// The resolved figures and when a status line last wrote them.
+pub fn read() -> Option<(Value, u64)> {
+    read_at(&state_path())
+}
+
+fn read_at(path: &Path) -> Option<(Value, u64)> {
+    let state: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let rate_limits = state.get("rate_limits").filter(|r| r.is_object())?;
+    Some((rate_limits.clone(), state.get("ts")?.as_u64()?))
+}
+
 /// Record this session's `rate_limits` and return the freshest account figures.
 /// Returns `None` when this render carries no `rate_limits`.
 pub fn update(input_json: &Value, now: u64) -> Option<Value> {
@@ -185,6 +197,18 @@ mod tests {
         update_at(&path, &render("a", 20.0), 1000 + SESSION_TTL_SECS + 1);
         let sessions = read_state(&path)["sessions"].as_object().unwrap().clone();
         assert_eq!(sessions.keys().collect::<Vec<_>>(), vec!["a"]);
+    }
+
+    #[test]
+    fn read_returns_resolved_figures() {
+        let (_dir, path) = setup();
+        assert!(read_at(&path).is_none());
+        update_at(&path, &render("a", 10.0), 1000);
+        let (rate_limits, as_of) = read_at(&path).unwrap();
+        assert_eq!(seven_day(&rate_limits), 10.0);
+        assert_eq!(as_of, 1000);
+        fs::write(&path, "{ not json").unwrap();
+        assert!(read_at(&path).is_none());
     }
 
     #[test]

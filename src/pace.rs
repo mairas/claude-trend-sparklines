@@ -1,3 +1,6 @@
+pub const FIVE_HOUR_MIN: f64 = 300.0;
+pub const SEVEN_DAY_MIN: f64 = 10080.0;
+
 /// Smallest share of the window, in percentage points, treated as time left.
 /// Keeps r finite in a window's last moments.
 const MIN_REMAINING_PCT: f64 = 1.0;

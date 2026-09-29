@@ -1,6 +1,7 @@
 mod format;
 mod git;
 mod history;
+mod inject;
 mod input;
 mod pace;
 mod sparkline;
@@ -10,11 +11,20 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
-    let (mut input, mut raw_input) = input::Input::from_stdin();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+
+    // Hook modes take the hook's JSON on stdin but need nothing from it. Drain it
+    // anyway, so the writer never sees a closed pipe.
+    if std::env::args().nth(1).as_deref() == Some("inject") {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        inject::run(now);
+        return;
+    }
+
+    let (mut input, mut raw_input) = input::Input::from_stdin();
 
     // Rate limits are account-wide, and this session's own may be stale: show and
     // record the freshest figures any session has seen.
@@ -77,11 +87,11 @@ fn main() {
 
     let window_5h = rl
         .and_then(|r| r.five_hour.as_ref())
-        .and_then(|w| render_window(w, "5h", 300.0, 8, now));
+        .and_then(|w| render_window(w, "5h", pace::FIVE_HOUR_MIN, 8, now));
 
     let window_7d = rl
         .and_then(|r| r.seven_day.as_ref())
-        .and_then(|w| render_window(w, "7d", 10080.0, 7, now));
+        .and_then(|w| render_window(w, "7d", pace::SEVEN_DAY_MIN, 7, now));
 
     let mut right2 = String::new();
     if let Some(w5) = window_5h {
