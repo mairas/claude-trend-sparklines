@@ -1,0 +1,99 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+language: en-US
+
+# Under 250 characters — the schema's limit.
+tone_instructions: >-
+  Name the trigger, the code path, and the user-visible consequence for every
+  finding. If you cannot name one, do not raise it. No praise, no preamble, no
+  restating the diff. Silence beats a nitpick.
+
+reviews:
+  profile: assertive
+  poem: false
+  in_progress_fortune: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+
+  high_level_summary_instructions: |
+    Write in present tense: "adds", not "added".
+    Lead with what changes in the status line or for the hooks that read its
+    state, not with the file list. Do not restate the PR description back to
+    the author.
+
+  pre_merge_checks:
+    title:
+      mode: warning
+      requirements: |
+        A reader who sees only the title should understand what the PR does.
+        Conventional-commit form: <type>(<scope>): <subject>, imperative mood.
+    # Quoted: bare `off` is a YAML 1.1 boolean, and this field takes a string.
+    description:
+      mode: "off"
+
+  tools:
+    # README is deliberate prose with a deliberate voice.
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+
+  path_instructions:
+    - path: '**/*'
+      instructions: |
+        ## Evidence, not impressions
+        Every finding states the trigger, the code path it runs through, and
+        what the user sees. A finding you cannot express that way is not one.
+        Say plainly when you are unsure rather than hedging an assertion.
+
+        ## Comments
+        Comments explain why the code is the way it is. Flag a comment that
+        narrates a change ("fixes X", "we used to Y"): every comment must read
+        correctly to someone who never saw the diff.
+
+        ## Do not ask for these
+        - **New dependencies** for convenience. The binary depends on serde and
+          serde_json only; that is the point of it being a rewrite of a shell
+          script.
+        - **Error reporting from the status line.** Claude Code prints whatever
+          the binary writes, so a missing file, an unreadable history or a
+          failed write degrades to less information, silently. Flag the
+          opposite: anything that can panic, print an error, or leave the
+          status line blank on bad or missing input.
+        - **A CHANGELOG.** There has never been one.
+
+        ## Scope
+        One logical change per PR. Flag substantial unrelated work and suggest
+        a separate PR; a called-out trivial fly-by fix is fine. Do not ask for
+        refactoring of code the PR merely touches.
+
+    - path: 'src/**/*.rs'
+      instructions: |
+        The binary runs on every status line render, in every open session at
+        once. Judge changes by that:
+
+        - **Cost per render.** Flag work that grows with the history file or
+          runs a subprocess without a cache.
+        - **Concurrency.** Several sessions render at the same moment and share
+          the files under `~/.claude/`. A write another process can observe
+          half-done is a bug; the state file is written to a per-process temp
+          file and renamed for that reason.
+        - **Usage is not monotonic.** Anthropic resets usage mid-window without
+          changing `resets_at`, and smaller drops also occur. Flag code that
+          assumes `used_percentage` only rises within a window.
+
+        **Judge whether a test can fail.** Value tests that fail when the
+        production change is reverted. Flag assertions that restate the
+        implementation's arithmetic rather than checking a stated expectation.
+
+    - path: '**/*.md'
+      instructions: |
+        Documentation describes the current state. Flag implementation-status
+        language ("Step 3", "TODO", "currently implemented as") and build
+        narratives.
+
+        This repository is **public**, so flag detail that identifies the
+        author's own infrastructure: host names, addresses, usernames or a list
+        of what runs on their machines. Paths under `~/.claude/` are Claude
+        Code's own layout and are fine.
