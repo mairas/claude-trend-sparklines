@@ -1,4 +1,5 @@
 mod format;
+mod gate;
 mod git;
 mod history;
 mod inject;
@@ -16,15 +17,15 @@ fn main() {
         .unwrap_or_default()
         .as_secs();
 
-    // Hook modes take the hook's JSON on stdin but need nothing from it. Drain it
-    // anyway, so the writer never sees a closed pipe.
-    if std::env::args().nth(1).as_deref() == Some("inject") {
-        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
-        inject::run(now);
-        return;
-    }
-
     let (mut input, mut raw_input) = input::Input::from_stdin();
+
+    // Hook modes. Reading stdin above also means the hook's writer never meets a
+    // closed pipe.
+    match std::env::args().nth(1).as_deref() {
+        Some("inject") => return inject::run(now),
+        Some("gate") => return gate::run(&raw_input, now),
+        _ => {}
+    }
 
     // Rate limits are account-wide, and this session's own may be stale: show and
     // record the freshest figures any session has seen.

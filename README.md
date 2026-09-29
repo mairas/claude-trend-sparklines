@@ -69,6 +69,28 @@ On every prompt it adds a block like this:
 
 Times are UTC, with `now` given so the model can tell when a reset has passed. `as_of` is when a status line on this machine last wrote the figures; quota spent elsewhere since then, on another machine or in a headless run, is not in them. Used percentages are rounded down. r is reported for the 7d window only. A window past its reset is left out, and with no live window or no state file the hook adds nothing. It reads only the state file the status line writes, so it needs the status line installed.
 
+### Gating subagents near the limit
+
+The `gate` hook stops fan-out from spending the last of the quota:
+
+| Condition | Decision |
+|---|---|
+| 5h ≥ 90% or 7d ≥ 95% | deny every subagent and workflow spawn until the window resets; the reason names the reset time and tells the model to continue inline |
+| 7d r < 0.75 | ask the user before a workflow fan-out |
+| otherwise | nothing |
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Agent|Workflow", "hooks": [{ "type": "command", "command": "/path/to/home/.claude/claude-trend-sparklines gate" }] }
+    ]
+  }
+}
+```
+
+The gate decides each spawn afresh. While it denies, the `inject` block carries a `<gate subagents="denied" by="5h at 92%" until="…"/>` element, so the model can see on a later prompt that the element is gone and spawning works again. Install the two hooks together: the element only reports what the gate would decide, and the deny reason refers to the block.
+
 ## Features
 
 - **Sparkline trend graphs** — 8-slot 5h window and 7-slot 7d window with interpolated boundary values

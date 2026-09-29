@@ -1,5 +1,5 @@
 use crate::pace::Limit;
-use crate::{format, pace, state};
+use crate::{format, gate, pace, state};
 use serde_json::{Value, json};
 
 /// `UserPromptSubmit` hook: add the account's usage to every prompt.
@@ -18,11 +18,13 @@ fn output(text: &str) -> Value {
     })
 }
 
-/// A `<usage_limits>` block with one element per live window, or `None` when no
-/// window is live. `as_of` is when a status line on this machine last wrote the
-/// figures: quota spent elsewhere since then is not in them.
+/// A `<usage_limits>` block with one element per live window, plus a `<gate>`
+/// element while subagents are denied, or `None` when no window is live. `as_of`
+/// is when a status line on this machine last wrote the figures: quota spent
+/// elsewhere since then is not in them.
 fn block(rate_limits: &Value, as_of: u64, now: u64) -> Option<String> {
-    let limits: Vec<String> = pace::live_windows(rate_limits, now)
+    let windows = pace::live_windows(rate_limits, now);
+    let mut limits: Vec<String> = windows
         .iter()
         .map(|w| {
             // r paces the week; the 5h window is read by its used % alone.
@@ -41,6 +43,15 @@ fn block(rate_limits: &Value, as_of: u64, now: u64) -> Option<String> {
             )
         })
         .collect();
+    if let Some(w) = gate::blocking(&windows) {
+        limits.push(format!(
+            "<gate subagents=\"denied\" by=\"{} at {}%\" until=\"{}, {}\"/>",
+            w.limit.label(),
+            w.used.floor(),
+            format::utc(w.resets_at),
+            format::relative(w.remaining_secs)
+        ));
+    }
 
     (!limits.is_empty()).then(|| {
         format!(
@@ -55,30 +66,13 @@ fn block(rate_limits: &Value, as_of: u64, now: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pace::{FIVE_HOUR_MIN, SEVEN_DAY_MIN};
-
-    /// 2026-09-21 14:13Z
-    const NOW: u64 = 1_790_000_000;
-
-    /// A window `elapsed_pct` of the way through, with `used` percent spent.
-    fn window(used: f64, elapsed_pct: f64, window_min: f64) -> Value {
-        let remaining_secs = window_min * 60.0 * (100.0 - elapsed_pct) / 100.0;
-        json!({ "used_percentage": used, "resets_at": NOW + remaining_secs as u64 })
-    }
-
-    fn limits(five_hour: Value, seven_day: Value) -> Value {
-        json!({ "five_hour": five_hour, "seven_day": seven_day })
-    }
+    use crate::pace::fixture::{NOW, limits, window};
 
     #[test]
     fn reports_every_live_window_with_r_for_the_week_only() {
         // 7d: 30% used at 50% elapsed, r = 1.40
-        let rl = limits(
-            window(20.0, 50.0, FIVE_HOUR_MIN),
-            window(30.0, 50.0, SEVEN_DAY_MIN),
-        );
         assert_eq!(
-            block(&rl, NOW - 3600, NOW).unwrap(),
+            block(&limits((20.0, 50.0), (30.0, 50.0)), NOW - 3600, NOW).unwrap(),
             "<usage_limits scope=\"account, all sessions\" as_of=\"2026-09-21 13:13Z\" now=\"2026-09-21 14:13Z\">\n\
              <limit window=\"5h\" used=\"20%\" resets=\"2026-09-21 16:43Z, in 2h 30m\"/>\n\
              <limit window=\"7d\" used=\"30%\" r=\"1.40\" resets=\"2026-09-25 02:13Z, in 3d 12h\"/>\n\
@@ -88,29 +82,45 @@ mod tests {
 
     #[test]
     fn used_rounds_down() {
-        let rl = limits(
-            window(99.6, 50.0, FIVE_HOUR_MIN),
-            window(30.0, 50.0, SEVEN_DAY_MIN),
-        );
-        let text = block(&rl, NOW, NOW).unwrap();
+        let text = block(&limits((99.6, 50.0), (30.0, 50.0)), NOW, NOW).unwrap();
         assert!(text.contains("window=\"5h\" used=\"99%\""), "{text}");
+    }
+
+    #[test]
+    fn shows_the_gate_while_subagents_are_denied() {
+        let text = block(&limits((92.0, 60.0), (40.0, 50.0)), NOW, NOW).unwrap();
+        assert!(
+            text.contains(
+                "\n<gate subagents=\"denied\" by=\"5h at 92%\" until=\"2026-09-21 16:13Z, in 2h 0m\"/>\n</usage_limits>"
+            ),
+            "{text}"
+        );
+        let quiet = block(&limits((89.0, 60.0), (40.0, 50.0)), NOW, NOW).unwrap();
+        assert!(!quiet.contains("<gate"), "{quiet}");
     }
 
     #[test]
     fn window_past_its_reset_is_left_out() {
         let expired = json!({ "used_percentage": 96.0, "resets_at": NOW - 60 });
-        let rl = limits(window(20.0, 50.0, FIVE_HOUR_MIN), expired.clone());
+        let rl = json!({
+            "five_hour": window(20.0, 50.0, pace::FIVE_HOUR_MIN),
+            "seven_day": expired,
+        });
         let text = block(&rl, NOW, NOW).unwrap();
         assert!(text.contains("window=\"5h\""), "{text}");
         assert!(!text.contains("window=\"7d\""), "{text}");
 
-        assert_eq!(block(&limits(expired.clone(), expired), NOW, NOW), None);
+        let rl = json!({ "five_hour": expired, "seven_day": expired });
+        assert_eq!(block(&rl, NOW, NOW), None);
     }
 
     #[test]
     fn window_resetting_now_is_left_out() {
         let now = json!({ "used_percentage": 96.0, "resets_at": NOW });
-        assert_eq!(block(&limits(now.clone(), now), NOW, NOW), None);
+        assert_eq!(
+            block(&json!({ "five_hour": now, "seven_day": now }), NOW, NOW),
+            None
+        );
     }
 
     #[test]
