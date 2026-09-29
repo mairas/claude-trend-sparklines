@@ -2,6 +2,7 @@ mod format;
 mod git;
 mod history;
 mod input;
+mod pace;
 mod sparkline;
 
 use std::path::Path;

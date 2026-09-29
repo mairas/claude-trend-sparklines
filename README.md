@@ -7,8 +7,7 @@ Opus 4.6 (1M) ◑ | my-project (main) +12/-3 ~4
 ████░░░░░░ 42% 1M | 5h ▁▂▃▄▅▆▇█ 39% ⇡3% 3h  7d ▃▃▄▅▆▇█ 43% ⇣2% 2d
 ```
 
-**⇣15%** green = 15% under pace, you have headroom.
-**⇡15%** red = 15% over pace, slow down.
+**⇡15%** = 15 points over pace, **⇣15%** = 15 points under. The color shows how hard the rest of the window has to be throttled, from the sustainable rate r = (100 − used%) / (100 − elapsed%): green when r ≥ 0.90, yellow ≥ 0.75, red below. The same overspend weighs more late in a window: 10 points over is r = 0.88 (yellow) at 15% elapsed and r = 0.75 at 60%.
 Sparklines show cumulative usage vs. linear pace — green blocks are under pace, red blocks are over, gray blocks are the future pace reference.
 
 ## Why a rewrite?
@@ -48,7 +47,7 @@ Restart Claude Code.
 ## Features
 
 - **Sparkline trend graphs** — 8-slot 5h window and 7-slot 7d window with interpolated boundary values
-- **Pace delta** — compares usage rate to time remaining (⇡ over / ⇣ under)
+- **Pace delta** — compares usage to elapsed time (⇡ over / ⇣ under), colored by how much the rest of the window must be throttled
 - **Effort level** — reads `effortLevel` from settings.json (●/◑/◔)
 - **Git integration** — branch name and diff stats with 5-second cache
 - **Worktree detection** — shows `repo/worktree` for Claude Code worktrees
