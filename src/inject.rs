@@ -1,4 +1,5 @@
-use crate::{pace, state};
+use crate::pace::Limit;
+use crate::{format, pace, state};
 use serde_json::{Value, json};
 
 /// `UserPromptSubmit` hook: add the account's usage to every prompt.
@@ -21,68 +22,34 @@ fn output(text: &str) -> Value {
 /// window is live. `as_of` is when a status line on this machine last wrote the
 /// figures: quota spent elsewhere since then is not in them.
 fn block(rate_limits: &Value, as_of: u64, now: u64) -> Option<String> {
-    let limits: Vec<String> = [
-        ("5h", "five_hour", pace::FIVE_HOUR_MIN),
-        ("7d", "seven_day", pace::SEVEN_DAY_MIN),
-    ]
-    .into_iter()
-    .filter_map(|(label, key, window_min)| {
-        let window = rate_limits.get(key)?;
-        let used = window.get("used_percentage")?.as_f64()?;
-        let resets_at = window.get("resets_at")?.as_u64()?;
-        // A window past its reset holds last window's figures.
-        let remaining_secs = resets_at.checked_sub(now).filter(|&s| s > 0)?;
-        // r paces the week; the 5h window is read by its used % alone.
-        let r = if key == "seven_day" {
-            let r = pace::ratio(used, remaining_secs as f64 / 60.0, window_min);
-            format!(" r=\"{r:.2}\"")
-        } else {
-            String::new()
-        };
-        Some(format!(
-            "<limit window=\"{label}\" used=\"{}%\"{r} resets=\"{}, {}\"/>",
-            // Rounded down, so the figure reaches a threshold only when the usage does.
-            used.floor(),
-            utc(resets_at),
-            relative(remaining_secs)
-        ))
-    })
-    .collect();
+    let limits: Vec<String> = pace::live_windows(rate_limits, now)
+        .iter()
+        .map(|w| {
+            // r paces the week; the 5h window is read by its used % alone.
+            let r = if w.limit == Limit::SevenDay {
+                format!(" r=\"{:.2}\"", w.r)
+            } else {
+                String::new()
+            };
+            format!(
+                "<limit window=\"{}\" used=\"{}%\"{r} resets=\"{}, {}\"/>",
+                w.limit.label(),
+                // Rounded down, so the figure reaches a threshold only when the usage does.
+                w.used.floor(),
+                format::utc(w.resets_at),
+                format::relative(w.remaining_secs)
+            )
+        })
+        .collect();
 
     (!limits.is_empty()).then(|| {
         format!(
             "<usage_limits scope=\"account, all sessions\" as_of=\"{}\" now=\"{}\">\n{}\n</usage_limits>",
-            utc(as_of),
-            utc(now),
+            format::utc(as_of),
+            format::utc(now),
             limits.join("\n")
         )
     })
-}
-
-fn relative(secs: u64) -> String {
-    let (days, hours, minutes) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
-    if days > 0 {
-        format!("in {days}d {hours}h")
-    } else if hours > 0 {
-        format!("in {hours}h {minutes}m")
-    } else {
-        format!("in {minutes}m")
-    }
-}
-
-/// Unix seconds as `YYYY-MM-DD HH:MMZ`.
-fn utc(secs: u64) -> String {
-    // Civil-from-days, http://howardhinnant.github.io/date_algorithms.html
-    let z = secs / 86_400 + 719_468;
-    let (era, doe) = (z / 146_097, z % 146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-    let (hour, minute) = (secs % 86_400 / 3600, secs % 3600 / 60);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}Z")
 }
 
 #[cfg(test)]
@@ -170,21 +137,5 @@ mod tests {
                 }
             })
         );
-    }
-
-    #[test]
-    fn relative_times() {
-        assert_eq!(relative(12 * 60), "in 12m");
-        assert_eq!(relative(100 * 60), "in 1h 40m");
-        assert_eq!(relative((3 * 24 + 4) * 3600 + 59), "in 3d 4h");
-        assert_eq!(relative(0), "in 0m");
-    }
-
-    #[test]
-    fn utc_times() {
-        assert_eq!(utc(0), "1970-01-01 00:00Z");
-        assert_eq!(utc(NOW), "2026-09-21 14:13Z");
-        // Last minute of a leap day
-        assert_eq!(utc(951_782_400 + 86_399), "2000-02-29 23:59Z");
     }
 }

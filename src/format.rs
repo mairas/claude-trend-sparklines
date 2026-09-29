@@ -73,6 +73,33 @@ fn pace_color(r: f64) -> &'static str {
     }
 }
 
+/// Plain relative time for model-facing text: "in 3d 4h", "in 1h 40m", "in 12m".
+pub fn relative(secs: u64) -> String {
+    let (days, hours, minutes) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
+    if days > 0 {
+        format!("in {days}d {hours}h")
+    } else if hours > 0 {
+        format!("in {hours}h {minutes}m")
+    } else {
+        format!("in {minutes}m")
+    }
+}
+
+/// Unix seconds as `YYYY-MM-DD HH:MMZ`, for model-facing text.
+pub fn utc(secs: u64) -> String {
+    // Civil-from-days, http://howardhinnant.github.io/date_algorithms.html
+    let z = secs / 86_400 + 719_468;
+    let (era, doe) = (z / 146_097, z % 146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    let (hour, minute) = (secs % 86_400 / 3600, secs % 3600 / 60);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}Z")
+}
+
 /// Measure visible (non-ANSI) character width of a string.
 pub fn visible_width(s: &str) -> usize {
     let mut width = 0;
@@ -211,6 +238,22 @@ mod tests {
         assert!(pace_delta(60.0, remaining(50.0), 300.0).starts_with(&format!(" {YELLOW}")));
         // 15 points over at 60%, r = 0.625
         assert!(pace_delta(75.0, remaining(60.0), 300.0).starts_with(&format!(" {RED}")));
+    }
+
+    #[test]
+    fn relative_times() {
+        assert_eq!(relative(12 * 60), "in 12m");
+        assert_eq!(relative(100 * 60), "in 1h 40m");
+        assert_eq!(relative((3 * 24 + 4) * 3600 + 59), "in 3d 4h");
+        assert_eq!(relative(0), "in 0m");
+    }
+
+    #[test]
+    fn utc_times() {
+        assert_eq!(utc(0), "1970-01-01 00:00Z");
+        assert_eq!(utc(1_790_000_000), "2026-09-21 14:13Z");
+        // Last minute of a leap day
+        assert_eq!(utc(951_782_400 + 86_399), "2000-02-29 23:59Z");
     }
 
     #[test]

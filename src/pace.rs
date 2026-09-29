@@ -1,5 +1,50 @@
+use serde_json::Value;
+
 pub const FIVE_HOUR_MIN: f64 = 300.0;
 pub const SEVEN_DAY_MIN: f64 = 10080.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit {
+    FiveHour,
+    SevenDay,
+}
+
+impl Limit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Limit::FiveHour => "5h",
+            Limit::SevenDay => "7d",
+        }
+    }
+}
+
+/// One rate-limit window that has not yet reset.
+pub struct Window {
+    pub limit: Limit,
+    pub used: f64,
+    pub r: f64,
+    pub resets_at: u64,
+    pub remaining_secs: u64,
+}
+
+/// The 5h and 7d windows in `rate_limits`, skipping any that are missing or
+/// already past their reset (those hold the previous window's figures).
+pub fn live_windows(rate_limits: &Value, now: u64) -> Vec<Window> {
+    [
+        (Limit::FiveHour, "five_hour", FIVE_HOUR_MIN),
+        (Limit::SevenDay, "seven_day", SEVEN_DAY_MIN),
+    ]
+    .into_iter()
+    .filter_map(|(limit, key, window_min)| {
+        let window = rate_limits.get(key)?;
+        let used = window.get("used_percentage")?.as_f64()?;
+        let resets_at = window.get("resets_at")?.as_u64()?;
+        let remaining_secs = resets_at.checked_sub(now).filter(|&s| s > 0)?;
+        let r = ratio(used, remaining_secs as f64 / 60.0, window_min);
+        Some(Window { limit, used, r, resets_at, remaining_secs })
+    })
+    .collect()
+}
 
 /// Smallest share of the window, in percentage points, treated as time left.
 /// Keeps r finite in a window's last moments.
