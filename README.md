@@ -44,6 +44,31 @@ Add to `~/.claude/settings.json`:
 
 Restart Claude Code.
 
+### Usage in the model's context
+
+The status line shows usage to you; the `inject` hook shows it to the model. Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "/path/to/home/.claude/claude-trend-sparklines inject" }] }
+    ]
+  }
+}
+```
+
+On every prompt it adds a block like this:
+
+```
+<usage_limits scope="account, all sessions" as_of="2026-09-21 14:12Z" now="2026-09-21 14:13Z">
+<limit window="5h" used="21%" resets="2026-09-21 16:42Z, in 2h 29m"/>
+<limit window="7d" used="74%" r="0.52" resets="2026-09-25 01:13Z, in 3d 11h"/>
+</usage_limits>
+```
+
+Times are UTC, with `now` given so the model can tell when a reset has passed. `as_of` is when a status line on this machine last wrote the figures; quota spent elsewhere since then, on another machine or in a headless run, is not in them. Used percentages are rounded down. r is reported for the 7d window only. A window past its reset is left out, and with no live window or no state file the hook adds nothing. It reads only the state file the status line writes, so it needs the status line installed.
+
 ## Features
 
 - **Sparkline trend graphs** — 8-slot 5h window and 7-slot 7d window with interpolated boundary values

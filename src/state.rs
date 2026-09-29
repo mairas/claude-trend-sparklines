@@ -14,13 +14,15 @@ fn state_path() -> PathBuf {
 }
 
 /// The resolved account `rate_limits`, for hooks. `None` if nothing has been recorded.
-pub fn read() -> Option<Value> {
+/// The resolved figures and when a status line last wrote them.
+pub fn read() -> Option<(Value, u64)> {
     read_at(&state_path())
 }
 
-fn read_at(path: &Path) -> Option<Value> {
+fn read_at(path: &Path) -> Option<(Value, u64)> {
     let state: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    state.get("rate_limits").filter(|r| r.is_object()).cloned()
+    let rate_limits = state.get("rate_limits").filter(|r| r.is_object())?;
+    Some((rate_limits.clone(), state.get("ts")?.as_u64()?))
 }
 
 /// Record this session's `rate_limits` and return the freshest account figures.
@@ -202,7 +204,9 @@ mod tests {
         let (_dir, path) = setup();
         assert!(read_at(&path).is_none());
         update_at(&path, &render("a", 10.0), 1000);
-        assert_eq!(seven_day(&read_at(&path).unwrap()), 10.0);
+        let (rate_limits, as_of) = read_at(&path).unwrap();
+        assert_eq!(seven_day(&rate_limits), 10.0);
+        assert_eq!(as_of, 1000);
         fs::write(&path, "{ not json").unwrap();
         assert!(read_at(&path).is_none());
     }
