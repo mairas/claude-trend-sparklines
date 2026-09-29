@@ -1,3 +1,5 @@
+use crate::pace;
+
 /// ANSI escape codes
 pub const GREEN: &str = "\x1b[32m";
 pub const YELLOW: &str = "\x1b[33m";
@@ -45,17 +47,29 @@ pub fn countdown(minutes: f64) -> String {
     }
 }
 
-/// Format pace delta with directional arrow.
-/// Positive = overspending (⇡, red), negative = surplus (⇣, green), zero = omit.
+/// Format pace delta with directional arrow: ⇡ over pace, ⇣ under, omitted when even.
+/// The color follows the sustainable rate r, so the same delta reads worse late in a window.
 pub fn pace_delta(used_pct: f64, remaining_min: f64, window_min: f64) -> String {
     let elapsed_pct = (window_min - remaining_min) / window_min * 100.0;
     let delta = (used_pct - elapsed_pct).round() as i64;
+    let color = pace_color(pace::ratio(used_pct, remaining_min, window_min));
     if delta > 0 {
-        format!(" {RED}⇡{delta}%{RESET}")
+        format!(" {color}⇡{delta}%{RESET}")
     } else if delta < 0 {
-        format!(" {GREEN}⇣{}%{RESET}", delta.abs())
+        format!(" {color}⇣{}%{RESET}", delta.abs())
     } else {
         String::new()
+    }
+}
+
+/// Color for the pace ratio r: green ≥0.9, yellow ≥0.75, red below.
+fn pace_color(r: f64) -> &'static str {
+    if r >= 0.9 {
+        GREEN
+    } else if r >= 0.75 {
+        YELLOW
+    } else {
+        RED
     }
 }
 
@@ -179,6 +193,24 @@ mod tests {
     fn pace_delta_even() {
         let pd = pace_delta(50.0, 150.0, 300.0);
         assert_eq!(pd, ""); // exactly on pace
+    }
+
+    fn remaining(elapsed_pct: f64) -> f64 {
+        300.0 * (100.0 - elapsed_pct) / 100.0
+    }
+
+    #[test]
+    fn pace_delta_color_follows_sustainable_rate() {
+        // under pace, r = 1.2
+        assert!(pace_delta(40.0, remaining(50.0), 300.0).starts_with(&format!(" {GREEN}")));
+        // 2 points over early, r = 0.98: no throttling
+        assert!(pace_delta(17.0, remaining(15.0), 300.0).starts_with(&format!(" {GREEN}")));
+        // 10 points over early, r = 0.88
+        assert!(pace_delta(25.0, remaining(15.0), 300.0).starts_with(&format!(" {YELLOW}")));
+        // 10 points over at 50%, r = 0.80
+        assert!(pace_delta(60.0, remaining(50.0), 300.0).starts_with(&format!(" {YELLOW}")));
+        // 15 points over at 60%, r = 0.625
+        assert!(pace_delta(75.0, remaining(60.0), 300.0).starts_with(&format!(" {RED}")));
     }
 
     #[test]
