@@ -59,6 +59,8 @@ Restart Claude Code.
 
 Usage data is logged to `~/.claude/claude-trend-sparklines.jsonl` every 10 minutes. Each line stores the full JSON context received from Claude Code, enabling future analysis beyond what the sparkline currently displays.
 
+Rate limits are account-wide, but each session's figures come from its own last API response, and a session renders whenever anything changes in it, including typing into one that has been idle for hours. So every render records its session's figures in `~/.claude/claude-trend-sparklines-state.json`, and the status line and the history show the figures that changed most recently in any session, not the ones this session happens to hold. A session's first report counts as unchanged. A real mid-window reset still wins, because it changes every active session's figures. Claude Code gives rate limits only to the status line, so hooks read the resolved figures from the same file.
+
 ## Requirements
 
 - Claude Code ≥ 2.1.80 (provides `rate_limits` in stdin)

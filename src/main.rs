@@ -3,16 +3,24 @@ mod git;
 mod history;
 mod input;
 mod sparkline;
+mod state;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
-    let (input, raw_input) = input::Input::from_stdin();
+    let (mut input, mut raw_input) = input::Input::from_stdin();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+
+    // Rate limits are account-wide, and this session's own may be stale: show and
+    // record the freshest figures any session has seen.
+    if let Some(resolved) = state::update(&raw_input, now) {
+        input.rate_limits = serde_json::from_value(resolved.clone()).ok();
+        raw_input["rate_limits"] = resolved;
+    }
 
     // ── Effort level from settings.json ──
     let effort_icon = read_effort_icon();
